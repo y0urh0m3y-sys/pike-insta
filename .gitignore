@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+bot_state.db
+session.json
+.env
