@@ -1,18 +1,16 @@
 import os
 import gc
 import time
-import random
 import logging
-import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from instagrapi import Client
 from dotenv import load_dotenv
 
-# Load local .env if present
+# Load local environment variables if available
 load_dotenv()
 
-# Setup logging format
+# Setup clean terminal logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -22,209 +20,142 @@ logging.basicConfig(
 USERNAME = os.getenv("IG_USERNAME", "pike.klaxon")
 PASSWORD = os.getenv("IG_PASSWORD", "205259")
 PORT = int(os.getenv("PORT", 10000))
-DB_PATH = "bot_state.db"
 SESSION_PATH = "session.json"
 
-DM_REPLY_TEMPLATE = "Hey @{username}! Thanks for reaching out. I'm away right now, will reply shortly."
+DM_REPLY_TEMPLATE = "Hey @{username}! I'm away right now, will reply shortly."
 GC_REPLY_TEMPLATE = "Hey {mentions}! Got your message: '{last_msg}'."
-
-POLL_INTERVAL_MIN = 30
-POLL_INTERVAL_MAX = 55
 # --------------------------------------------------
 
 
-# ----------------- 1. Lightweight Ping Server -----
+# ----------------- 1. Ultra-Light Ping Server -----
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+    def do_HEAD(self):
+        """Zero-byte response for cron monitoring tools."""
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Length", "0")
         self.end_headers()
-        self.wfile.write(b"Bot is healthy and polling.")
+
+    def do_GET(self):
+        """Minimal 2-byte response to prevent 'Output too large' errors."""
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # Silence access logs to prevent stdout flooding
+        # Mute access logs to prevent memory/log clutter
         return
 
 
 def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logging.info(f"Health server running on port {PORT}")
+    logging.info(f"Keep-alive health server running on port {PORT}")
     server.serve_forever()
 
 
-# ----------------- 2. SQLite State & Memory Pruning
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS processed_messages (
-                msg_id TEXT PRIMARY KEY,
-                timestamp REAL
-            )
-        """)
-        conn.commit()
-
-
-def is_processed(msg_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM processed_messages WHERE msg_id = ?", (str(msg_id),))
-        return cur.fetchone() is not None
-
-
-def mark_processed(msg_ids):
-    if not msg_ids:
-        return
-    now = time.time()
-    records = [(str(mid), now) for mid in msg_ids]
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executemany("INSERT OR IGNORE INTO processed_messages VALUES (?, ?)", records)
-        conn.commit()
-
-
-def prune_old_db_records(max_age_seconds=172800):
-    """Deletes records older than 48 hours to prevent unbounded disk growth."""
-    cutoff = time.time() - max_age_seconds
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM processed_messages WHERE timestamp < ?", (cutoff,))
-        conn.commit()
-
-
-# ----------------- 3. Instagram Engine ------------
-def login_client(username, password, session_file=SESSION_PATH):
-    cl = Client()
-    cl.request_timeout = 15
-
-    if os.path.exists(session_file):
-        try:
-            cl.load_settings(session_file)
-            cl.login(username, password)
-            logging.info("Logged in using existing session.json")
-            return cl
-        except Exception as err:
-            logging.warning(f"Saved session rejected ({err}). Logging in fresh...")
-
-    cl.login(username, password)
-    cl.dump_settings(session_file)
-    logging.info("New session saved to session.json")
-    return cl
-
-
-def process_threads(cl, bot_user_id):
+# ----------------- 2. Event Handler ----------------
+def handle_incoming_message(cl, bot_user_id, thread_id, message):
+    """Instantly processes incoming message and purges objects from memory."""
     try:
-        # Fetching a small batch keeps memory footprint around 60MB
-        threads = cl.direct_threads(amount=6)
-    except Exception as e:
-        logging.error(f"Error fetching threads: {e}")
-        return
+        sender_id = str(message.user_id)
 
-    for thread in threads:
-        thread_id = thread.id
+        # Ignore messages sent by the bot account itself
+        if sender_id == str(bot_user_id):
+            return
+
+        thread = cl.direct_thread(thread_id)
         is_group = thread.is_group
-        messages = thread.messages
 
-        if not messages:
-            continue
-
-        latest_msg = messages[0]
-        msg_id = str(latest_msg.id)
-        sender_id = str(latest_msg.user_id)
-
-        # Skip if already replied or if the bot itself sent the message
-        if is_processed(msg_id) or sender_id == str(bot_user_id):
-            continue
-
-        # ---------------- Direct Message ----------------
+        # Direct Messages (DM)
         if not is_group:
             sender_user = thread.users[0] if thread.users else None
             sender_username = sender_user.username if sender_user else "there"
             reply_text = DM_REPLY_TEMPLATE.format(username=sender_username)
+            cl.direct_send(reply_text, thread_ids=[thread_id])
+            logging.info(f"[Instant DM] Replied to @{sender_username}")
 
-            try:
-                cl.direct_send(reply_text, thread_ids=[thread_id])
-                logging.info(f"[DM] Replied to @{sender_username}")
-                mark_processed([msg_id])
-            except Exception as e:
-                logging.error(f"Failed to reply to DM {thread_id}: {e}")
-
-        # ---------------- Group Chat ----------------
+        # Group Chats (GC)
         else:
-            recent_unanswered = []
-            for msg in messages[:4]:
-                if is_processed(msg.id):
-                    break
-                if str(msg.user_id) != str(bot_user_id):
-                    recent_unanswered.append(msg)
-
-            if not recent_unanswered:
-                continue
-
             user_map = {str(u.pk): u.username for u in thread.users}
-            unique_senders = list({str(m.user_id) for m in recent_unanswered})
-
-            mentions = [
-                f"@{user_map[uid]}"
-                for uid in unique_senders
-                if uid in user_map
-            ]
-
-            if not mentions:
-                continue
-
-            mentions_str = " ".join(mentions)
-            last_text = (latest_msg.text or "[media]")[:40]
+            username = user_map.get(sender_id, "member")
+            last_text = (message.text or "[media]")[:40]
 
             reply_text = GC_REPLY_TEMPLATE.format(
-                mentions=mentions_str,
+                mentions=f"@{username}",
                 last_msg=last_text
             )
+            cl.direct_send(reply_text, thread_ids=[thread_id])
+            logging.info(f"[Instant GC] Replied to @{username} in thread {thread_id}")
 
-            try:
-                cl.direct_send(reply_text, thread_ids=[thread_id])
-                logging.info(f"[GC] Mentioned {mentions_str} in thread {thread_id}")
-                mark_processed([m.id for m in recent_unanswered])
-            except Exception as e:
-                logging.error(f"Failed to reply to GC {thread_id}: {e}")
+        # Clear local scope references immediately
+        del thread
+        del message
+
+    except Exception as e:
+        logging.error(f"Error handling incoming message: {e}")
+
+    finally:
+        # Force Python garbage collector to free RAM instantly
+        gc.collect()
+
+
+# ----------------- 3. Client Session & Engine -----
+def login_client(username, password):
+    cl = Client()
+    cl.request_timeout = 15
+
+    if os.path.exists(SESSION_PATH):
+        try:
+            cl.load_settings(SESSION_PATH)
+            cl.login(username, password)
+            logging.info("Successfully authenticated with cached session.json")
+            return cl
+        except Exception as err:
+            logging.warning(f"Cached session rejected ({err}). Logging in fresh...")
+
+    cl.login(username, password)
+    cl.dump_settings(SESSION_PATH)
+    logging.info("Saved fresh session.json")
+    return cl
 
 
 def main():
-    init_db()
-
-    # Spin up health server thread
+    # Start web keep-alive server daemon
     server_thread = threading.Thread(target=run_health_server, daemon=True)
     server_thread.start()
 
+    # Initial login
     cl = login_client(USERNAME, PASSWORD)
     bot_user_id = cl.user_id
-    logging.info(f"Bot active for @{USERNAME} (ID: {bot_user_id})")
+    logging.info(f"Bot connected for @{USERNAME} (ID: {bot_user_id})")
 
-    # Initial sync to ignore existing unread messages prior to boot
-    try:
-        initial_threads = cl.direct_threads(amount=6)
-        initial_ids = [t.messages[0].id for t in initial_threads if t.messages]
-        mark_processed(initial_ids)
-        del initial_threads
-    except Exception as e:
-        logging.warning(f"Initial sync warning: {e}")
+    # Define message callback
+    def on_direct_message(message):
+        thread_id = getattr(message, "thread_id", None)
+        if thread_id:
+            handle_incoming_message(cl, bot_user_id, thread_id, message)
 
-    loop_counter = 0
-
+    # Infinite auto-reconnect loop to prevent crashes on network drops
+    backoff_delay = 5
     while True:
         try:
-            process_threads(cl, bot_user_id)
+            logging.info("Realtime push listener active. Waiting for incoming messages...")
+            # Blocking realtime connection (uses ~0% CPU while idle)
+            cl.start_realtime(on_direct_message)
         except Exception as e:
-            logging.error(f"Unexpected loop exception: {e}")
-
-        # Prune old records every 100 cycles (~1 hour)
-        loop_counter += 1
-        if loop_counter >= 100:
-            prune_old_db_records()
-            loop_counter = 0
-
-        # Run garbage collector to clear request heap
-        gc.collect()
-
-        sleep_time = random.uniform(POLL_INTERVAL_MIN, POLL_INTERVAL_MAX)
-        time.sleep(sleep_time)
+            logging.warning(f"Connection dropped: {e}. Reconnecting in {backoff_delay} seconds...")
+            time.sleep(backoff_delay)
+            # Try to re-establish session if dropped
+            try:
+                cl = login_client(USERNAME, PASSWORD)
+                bot_user_id = cl.user_id
+                backoff_delay = 5  # Reset backoff on success
+            except Exception as login_err:
+                logging.error(f"Re-login failed: {login_err}")
+                backoff_delay = min(backoff_delay * 2, 60)  # Exponential backoff up to 1 min
 
 
 if __name__ == "__main__":
