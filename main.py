@@ -8,8 +8,10 @@ from socketserver import ThreadingMixIn
 from instagrapi import Client
 from dotenv import load_dotenv
 
+# Load local environment variables
 load_dotenv()
 
+# Setup terminal logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -18,7 +20,6 @@ logging.basicConfig(
 # ----------------- Configuration -----------------
 USERNAME = os.getenv("IG_USERNAME", "pike.klaxon")
 PASSWORD = os.getenv("IG_PASSWORD", "205259")
-# Render hamesha PORT dynamic deta hai, fallback 10000
 PORT = int(os.environ.get("PORT", 10000))
 SESSION_PATH = "session.json"
 
@@ -27,7 +28,7 @@ GC_REPLY_TEMPLATE = "Hey {mentions}! Got your message: '{last_msg}'."
 # --------------------------------------------------
 
 
-# --- 1. Bulletproof Web Server (Main Thread) ---
+# --- 1. Render Health-Check Server (Main Thread) ---
 class HealthHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(200)
@@ -44,7 +45,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # Mute logs to keep stdout clean
         return
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -55,11 +55,18 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # --- 2. Instagram Bot Worker (Background Thread) ---
 def run_instagram_bot():
     logging.info("Starting Instagram bot worker in background...")
-    # Thoda wait taaki port bind confirm ho jaye
     time.sleep(2)
 
     cl = Client()
-    cl.request_timeout = 20
+    cl.request_timeout = 25
+
+    # Bypass "version out of date" error with latest Android headers
+    cl.set_user_agent(
+        "Instagram 320.0.0.35.108 Android (34/14; 420dpi; 1080x2400; Google/google; Pixel 8; shiba; shiba; en_US; 578023194)"
+    )
+    cl.set_country("US")
+    cl.set_locale("en_US")
+    cl.set_timezone_offset(-5 * 3600)
 
     # Login flow
     logged_in = False
@@ -70,31 +77,34 @@ def run_instagram_bot():
             logged_in = True
             logging.info("Logged in using existing session.json")
         except Exception as e:
-            logging.warning(f"Session login failed: {e}. Trying fresh login...")
+            logging.warning(f"Cached session expired ({e}). Attempting fresh login...")
 
     if not logged_in:
         try:
-            logging.info(f"Logging in fresh for @{USERNAME}...")
+            logging.info(f"Logging in fresh for @{USERNAME} with updated Android headers...")
             cl.login(USERNAME, PASSWORD)
             cl.dump_settings(SESSION_PATH)
             logging.info("Fresh login successful. Session saved.")
         except Exception as e:
             logging.error(f"INSTAGRAM LOGIN FAILED: {e}")
-            logging.error("If it asks for Challenge/2FA, approve it on your phone app!")
+            logging.error("If challenge/2FA prompted, approve 'This was me' on your phone app!")
             return
 
     bot_user_id = str(cl.user_id)
     logging.info(f"Bot successfully hooked for @{USERNAME} (ID: {bot_user_id})")
 
-    def on_direct_message(message):
+    # Realtime message event handler
+    def handle_message(message):
         try:
             sender_id = str(getattr(message, "user_id", ""))
-            if sender_id == bot_user_id:
+            if sender_id == bot_user_id or not sender_id:
                 return
 
             thread_id = getattr(message, "thread_id", None)
             if not thread_id:
                 return
+
+            logging.info(f"New incoming message in thread {thread_id} from {sender_id}")
 
             thread = cl.direct_thread(thread_id)
             if not thread.is_group:
@@ -105,35 +115,35 @@ def run_instagram_bot():
             else:
                 user_map = {str(u.pk): u.username for u in thread.users}
                 uname = user_map.get(sender_id, "member")
-                text = (message.text or "[media]")[:35]
+                text = (getattr(message, "text", "") or "[media]")[:35]
                 cl.direct_send(GC_REPLY_TEMPLATE.format(mentions=f"@{uname}", last_msg=text), thread_ids=[thread_id])
                 logging.info(f"[Instant GC] -> Replied to @{uname}")
 
             del thread
-            del message
         except Exception as err:
             logging.error(f"Message handling error: {err}")
         finally:
             gc.collect()
 
+    # Reconnect loop (zero crash on socket drop)
     while True:
         try:
-            logging.info("MQTT Push listener active. Waiting for messages...")
-            cl.start_realtime(on_direct_message)
+            logging.info("MQTT Push listener active. Waiting for messages in real time...")
+            cl.start_realtime(handle_message)
         except Exception as err:
             logging.warning(f"MQTT disconnected: {err}. Reconnecting in 10s...")
             time.sleep(10)
 
 
 def main():
-    # 1. Instagram bot ko background daemon thread me daalo
+    # 1. Start Instagram worker thread
     bot_thread = threading.Thread(target=run_instagram_bot, daemon=True)
     bot_thread.start()
 
-    # 2. Main thread par Web Server bind karo (Render ko 0.1 sec me signal mil jayega)
+    # 2. Start HTTP Health server on Main thread
     try:
         server = ThreadedHTTPServer(("0.0.0.0", PORT), HealthHandler)
-        logging.info(f"Health server bound to port {PORT} on MAIN thread. Render will NOT kill this.")
+        logging.info(f"Health check server LIVE on port {PORT} (Main Thread)")
         server.serve_forever()
     except Exception as e:
         logging.error(f"Failed to start health server: {e}")
